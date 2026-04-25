@@ -1,0 +1,8 @@
+node_modules/
+.env
+.env.local
+*.sqlite
+*.sqlite-journal
+data/
+dist/
+.DS_Store
