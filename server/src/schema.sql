@@ -1,40 +1,40 @@
 -- Single-household app: at most one row in households (created on first signup).
 CREATE TABLE IF NOT EXISTS households (
-  id INTEGER PRIMARY KEY,
+  id SERIAL PRIMARY KEY,
   name TEXT NOT NULL DEFAULT 'Our household',
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
 CREATE TABLE IF NOT EXISTS users (
-  id INTEGER PRIMARY KEY,
+  id SERIAL PRIMARY KEY,
   household_id INTEGER NOT NULL REFERENCES households(id),
   email TEXT NOT NULL UNIQUE,
   display_name TEXT NOT NULL,
   password_hash TEXT NOT NULL,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- One preferences row per household. Free-form JSON in `data`.
+-- One preferences row per household. JSON stored as TEXT to keep route logic
+-- identical to the SQLite original (we never query inside the JSON anyway).
 CREATE TABLE IF NOT EXISTS preferences (
   household_id INTEGER PRIMARY KEY REFERENCES households(id),
   data TEXT NOT NULL,
-  updated_at TEXT NOT NULL DEFAULT (datetime('now'))
+  updated_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Each generated week. week_start is the Monday (YYYY-MM-DD).
+-- week_start is the Monday of the week (stored as 'YYYY-MM-DD' text for round-trip stability).
 CREATE TABLE IF NOT EXISTS weeks (
-  id INTEGER PRIMARY KEY,
+  id SERIAL PRIMARY KEY,
   household_id INTEGER NOT NULL REFERENCES households(id),
   week_start TEXT NOT NULL,
   weekly_theme TEXT,
   staples_json TEXT NOT NULL DEFAULT '[]',
-  created_at TEXT NOT NULL DEFAULT (datetime('now')),
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   UNIQUE(household_id, week_start)
 );
 
--- Generated meals attached to a week.
 CREATE TABLE IF NOT EXISTS meals (
-  id INTEGER PRIMARY KEY,
+  id SERIAL PRIMARY KEY,
   week_id INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
   meal_type TEXT NOT NULL CHECK (meal_type IN ('lunch','dinner')),
   position INTEGER NOT NULL,
@@ -50,39 +50,36 @@ CREATE TABLE IF NOT EXISTS meals (
 
 CREATE INDEX IF NOT EXISTS idx_meals_week ON meals(week_id);
 
--- One vote per (meal, user). vote: 1 = yes, 0 = no, NULL means not yet voted.
+-- vote: 1 = yes, 0 = no. Row absent = not yet voted.
 CREATE TABLE IF NOT EXISTS meal_votes (
   meal_id INTEGER NOT NULL REFERENCES meals(id) ON DELETE CASCADE,
   user_id INTEGER NOT NULL REFERENCES users(id),
-  vote INTEGER CHECK (vote IN (0,1)),
-  voted_at TEXT NOT NULL DEFAULT (datetime('now')),
+  vote SMALLINT CHECK (vote IN (0, 1)),
+  voted_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
   PRIMARY KEY (meal_id, user_id)
 );
 
 -- Per-week staples checklist (household-shared).
--- needed = 1 means "we need to buy this", 0 means "we have it / already declined".
 CREATE TABLE IF NOT EXISTS staples_check (
   week_id INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
   staple TEXT NOT NULL,
-  needed INTEGER NOT NULL DEFAULT 0,
+  needed SMALLINT NOT NULL DEFAULT 0,
   PRIMARY KEY (week_id, staple)
 );
 
--- Manually-added grocery items (separate from meal-derived).
 CREATE TABLE IF NOT EXISTS manual_grocery (
-  id INTEGER PRIMARY KEY,
+  id SERIAL PRIMARY KEY,
   week_id INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
   added_by INTEGER NOT NULL REFERENCES users(id),
   name TEXT NOT NULL,
   category TEXT,
-  checked INTEGER NOT NULL DEFAULT 0,
-  created_at TEXT NOT NULL DEFAULT (datetime('now'))
+  checked SMALLINT NOT NULL DEFAULT 0,
+  created_at TIMESTAMPTZ NOT NULL DEFAULT NOW()
 );
 
--- Per-week per-user "checked off in store" state for meal-derived items.
 CREATE TABLE IF NOT EXISTS grocery_check (
   week_id INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
   item_key TEXT NOT NULL,
-  checked INTEGER NOT NULL DEFAULT 0,
+  checked SMALLINT NOT NULL DEFAULT 0,
   PRIMARY KEY (week_id, item_key)
 );

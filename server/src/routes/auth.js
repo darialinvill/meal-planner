@@ -1,6 +1,6 @@
 import { Router } from 'express';
 import bcrypt from 'bcrypt';
-import { db } from '../db.js';
+import { one, query, tx } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 
 const router = Router();
@@ -20,47 +20,64 @@ const DEFAULT_PREFS = {
   notes: '',
 };
 
-router.post('/signup', async (req, res) => {
-  const { email, password, display_name } = req.body || {};
-  if (!email || !password || !display_name) {
-    return res.status(400).json({ error: 'email, password, and display_name are required' });
+router.post('/signup', async (req, res, next) => {
+  try {
+    const { email, password, display_name } = req.body || {};
+    if (!email || !password || !display_name) {
+      return res.status(400).json({ error: 'email, password, and display_name are required' });
+    }
+    if (password.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
+
+    const existing = await one('SELECT id FROM users WHERE email = $1', [email]);
+    if (existing) return res.status(409).json({ error: 'email already in use' });
+
+    const hash = await bcrypt.hash(password, 12);
+
+    const userRow = await tx(async (client) => {
+      let household = (await client.query('SELECT id FROM households LIMIT 1')).rows[0];
+      if (!household) {
+        const { rows } = await client.query(
+          'INSERT INTO households (name) VALUES ($1) RETURNING id',
+          ['Our household'],
+        );
+        household = rows[0];
+        await client.query(
+          'INSERT INTO preferences (household_id, data) VALUES ($1, $2)',
+          [household.id, JSON.stringify(DEFAULT_PREFS)],
+        );
+      }
+      const { rows } = await client.query(
+        `INSERT INTO users (household_id, email, display_name, password_hash)
+         VALUES ($1, $2, $3, $4)
+         RETURNING id, email, display_name, household_id`,
+        [household.id, email, display_name, hash],
+      );
+      return rows[0];
+    });
+
+    req.session.userId = userRow.id;
+    res.json(userRow);
+  } catch (err) {
+    next(err);
   }
-  if (password.length < 8) return res.status(400).json({ error: 'password must be at least 8 characters' });
-
-  const existing = db.prepare('SELECT id FROM users WHERE email = ?').get(email);
-  if (existing) return res.status(409).json({ error: 'email already in use' });
-
-  let household = db.prepare('SELECT id FROM households LIMIT 1').get();
-  if (!household) {
-    const info = db.prepare('INSERT INTO households (name) VALUES (?)').run('Our household');
-    household = { id: info.lastInsertRowid };
-    db.prepare('INSERT INTO preferences (household_id, data) VALUES (?, ?)').run(
-      household.id,
-      JSON.stringify(DEFAULT_PREFS),
-    );
-  }
-
-  const hash = await bcrypt.hash(password, 12);
-  const info = db
-    .prepare('INSERT INTO users (household_id, email, display_name, password_hash) VALUES (?, ?, ?, ?)')
-    .run(household.id, email, display_name, hash);
-
-  req.session.userId = info.lastInsertRowid;
-  res.json({ id: info.lastInsertRowid, email, display_name, household_id: household.id });
 });
 
-router.post('/login', async (req, res) => {
-  const { email, password } = req.body || {};
-  if (!email || !password) return res.status(400).json({ error: 'email and password required' });
+router.post('/login', async (req, res, next) => {
+  try {
+    const { email, password } = req.body || {};
+    if (!email || !password) return res.status(400).json({ error: 'email and password required' });
 
-  const user = db.prepare('SELECT * FROM users WHERE email = ?').get(email);
-  if (!user) return res.status(401).json({ error: 'invalid credentials' });
+    const user = await one('SELECT * FROM users WHERE email = $1', [email]);
+    if (!user) return res.status(401).json({ error: 'invalid credentials' });
 
-  const ok = await bcrypt.compare(password, user.password_hash);
-  if (!ok) return res.status(401).json({ error: 'invalid credentials' });
+    const ok = await bcrypt.compare(password, user.password_hash);
+    if (!ok) return res.status(401).json({ error: 'invalid credentials' });
 
-  req.session.userId = user.id;
-  res.json({ id: user.id, email: user.email, display_name: user.display_name, household_id: user.household_id });
+    req.session.userId = user.id;
+    res.json({ id: user.id, email: user.email, display_name: user.display_name, household_id: user.household_id });
+  } catch (err) {
+    next(err);
+  }
 });
 
 router.post('/logout', (req, res) => {

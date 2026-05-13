@@ -1,5 +1,5 @@
 import { Router } from 'express';
-import { db } from '../db.js';
+import { one, query } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
 import { mondayOf } from '../lib/weeks.js';
 
@@ -11,26 +11,21 @@ function itemKey(item) {
 }
 
 function loadWeek(householdId, weekStart) {
-  return db.prepare('SELECT * FROM weeks WHERE household_id = ? AND week_start = ?').get(householdId, weekStart);
+  return one('SELECT * FROM weeks WHERE household_id = $1 AND week_start = $2', [householdId, weekStart]);
 }
 
-// Aggregates the meal-derived grocery list:
-// - includes each meal where AT LEAST ONE user voted yes
-// - dedupes by (lowercased name, category)
-// - groups by category, with the contributing meal names attached
-function buildGroceryList(weekId) {
-  const meals = db
-    .prepare(
-      `SELECT m.id, m.name, m.grocery_items_json,
-              SUM(CASE WHEN mv.vote = 1 THEN 1 ELSE 0 END) AS yes_votes
-         FROM meals m
-         LEFT JOIN meal_votes mv ON mv.meal_id = m.id
-         WHERE m.week_id = ?
-         GROUP BY m.id`,
-    )
-    .all(weekId);
+async function buildGroceryList(weekId) {
+  const meals = await query(
+    `SELECT m.id, m.name, m.grocery_items_json,
+            COALESCE(SUM(CASE WHEN mv.vote = 1 THEN 1 ELSE 0 END), 0) AS yes_votes
+       FROM meals m
+       LEFT JOIN meal_votes mv ON mv.meal_id = m.id
+       WHERE m.week_id = $1
+       GROUP BY m.id`,
+    [weekId],
+  );
 
-  const approved = meals.filter((m) => (m.yes_votes || 0) >= 1);
+  const approved = meals.filter((m) => Number(m.yes_votes) >= 1);
 
   const aggregated = new Map();
   for (const m of approved) {
@@ -53,9 +48,7 @@ function buildGroceryList(weekId) {
     }
   }
 
-  const checks = db
-    .prepare('SELECT item_key, checked FROM grocery_check WHERE week_id = ?')
-    .all(weekId);
+  const checks = await query('SELECT item_key, checked FROM grocery_check WHERE week_id = $1', [weekId]);
   const checkMap = new Map(checks.map((c) => [c.item_key, !!c.checked]));
 
   const list = Array.from(aggregated.values()).map((e) => ({
@@ -64,7 +57,6 @@ function buildGroceryList(weekId) {
     checked: checkMap.get(e.key) || false,
   }));
 
-  // group by category
   const byCategory = {};
   for (const it of list) (byCategory[it.category] ||= []).push(it);
   for (const cat of Object.keys(byCategory)) {
@@ -73,80 +65,104 @@ function buildGroceryList(weekId) {
   return byCategory;
 }
 
-router.get('/current', (req, res) => {
-  const weekStart = mondayOf();
-  const week = loadWeek(req.user.household_id, weekStart);
-  if (!week) return res.json({ exists: false, week_start: weekStart });
+router.get('/current', async (req, res, next) => {
+  try {
+    const weekStart = mondayOf();
+    const week = await loadWeek(req.user.household_id, weekStart);
+    if (!week) return res.json({ exists: false, week_start: weekStart });
 
-  const fromMeals = buildGroceryList(week.id);
+    const fromMeals = await buildGroceryList(week.id);
 
-  const manual = db
-    .prepare(
+    const manual = await query(
       `SELECT mg.id, mg.name, mg.category, mg.checked, u.display_name AS added_by_name
          FROM manual_grocery mg JOIN users u ON u.id = mg.added_by
-         WHERE mg.week_id = ?
+         WHERE mg.week_id = $1
          ORDER BY mg.created_at`,
-    )
-    .all(week.id);
+      [week.id],
+    );
 
-  res.json({
-    exists: true,
-    week_id: week.id,
-    week_start: week.week_start,
-    from_meals: fromMeals,
-    manual,
-  });
+    res.json({
+      exists: true,
+      week_id: week.id,
+      week_start: week.week_start,
+      from_meals: fromMeals,
+      manual,
+    });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post('/check', (req, res) => {
-  const { week_id, item_key, checked } = req.body || {};
-  if (!week_id || !item_key) return res.status(400).json({ error: 'week_id and item_key required' });
-  // verify the week belongs to this household
-  const week = db.prepare('SELECT id FROM weeks WHERE id = ? AND household_id = ?').get(week_id, req.user.household_id);
-  if (!week) return res.status(404).json({ error: 'week not found' });
-  db.prepare(
-    `INSERT INTO grocery_check (week_id, item_key, checked) VALUES (?, ?, ?)
-     ON CONFLICT(week_id, item_key) DO UPDATE SET checked = excluded.checked`,
-  ).run(week_id, item_key, checked ? 1 : 0);
-  res.json({ ok: true });
+router.post('/check', async (req, res, next) => {
+  try {
+    const { week_id, item_key, checked } = req.body || {};
+    if (!week_id || !item_key) return res.status(400).json({ error: 'week_id and item_key required' });
+    const week = await one(
+      'SELECT id FROM weeks WHERE id = $1 AND household_id = $2',
+      [week_id, req.user.household_id],
+    );
+    if (!week) return res.status(404).json({ error: 'week not found' });
+    await query(
+      `INSERT INTO grocery_check (week_id, item_key, checked) VALUES ($1, $2, $3)
+       ON CONFLICT (week_id, item_key) DO UPDATE SET checked = EXCLUDED.checked`,
+      [week_id, item_key, checked ? 1 : 0],
+    );
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post('/manual', (req, res) => {
-  const { week_id, name, category } = req.body || {};
-  if (!week_id || !name) return res.status(400).json({ error: 'week_id and name required' });
-  const week = db.prepare('SELECT id FROM weeks WHERE id = ? AND household_id = ?').get(week_id, req.user.household_id);
-  if (!week) return res.status(404).json({ error: 'week not found' });
-  const info = db
-    .prepare('INSERT INTO manual_grocery (week_id, added_by, name, category) VALUES (?, ?, ?, ?)')
-    .run(week_id, req.user.id, name.trim(), category || null);
-  res.json({ id: info.lastInsertRowid });
+router.post('/manual', async (req, res, next) => {
+  try {
+    const { week_id, name, category } = req.body || {};
+    if (!week_id || !name) return res.status(400).json({ error: 'week_id and name required' });
+    const week = await one(
+      'SELECT id FROM weeks WHERE id = $1 AND household_id = $2',
+      [week_id, req.user.household_id],
+    );
+    if (!week) return res.status(404).json({ error: 'week not found' });
+    const row = await one(
+      'INSERT INTO manual_grocery (week_id, added_by, name, category) VALUES ($1, $2, $3, $4) RETURNING id',
+      [week_id, req.user.id, name.trim(), category || null],
+    );
+    res.json({ id: row.id });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.post('/manual/:id/check', (req, res) => {
-  const id = Number(req.params.id);
-  const { checked } = req.body || {};
-  const row = db
-    .prepare(
+router.post('/manual/:id/check', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const { checked } = req.body || {};
+    const row = await one(
       `SELECT mg.id FROM manual_grocery mg JOIN weeks w ON w.id = mg.week_id
-       WHERE mg.id = ? AND w.household_id = ?`,
-    )
-    .get(id, req.user.household_id);
-  if (!row) return res.status(404).json({ error: 'item not found' });
-  db.prepare('UPDATE manual_grocery SET checked = ? WHERE id = ?').run(checked ? 1 : 0, id);
-  res.json({ ok: true });
+       WHERE mg.id = $1 AND w.household_id = $2`,
+      [id, req.user.household_id],
+    );
+    if (!row) return res.status(404).json({ error: 'item not found' });
+    await query('UPDATE manual_grocery SET checked = $1 WHERE id = $2', [checked ? 1 : 0, id]);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
 });
 
-router.delete('/manual/:id', (req, res) => {
-  const id = Number(req.params.id);
-  const row = db
-    .prepare(
+router.delete('/manual/:id', async (req, res, next) => {
+  try {
+    const id = Number(req.params.id);
+    const row = await one(
       `SELECT mg.id FROM manual_grocery mg JOIN weeks w ON w.id = mg.week_id
-       WHERE mg.id = ? AND w.household_id = ?`,
-    )
-    .get(id, req.user.household_id);
-  if (!row) return res.status(404).json({ error: 'item not found' });
-  db.prepare('DELETE FROM manual_grocery WHERE id = ?').run(id);
-  res.json({ ok: true });
+       WHERE mg.id = $1 AND w.household_id = $2`,
+      [id, req.user.household_id],
+    );
+    if (!row) return res.status(404).json({ error: 'item not found' });
+    await query('DELETE FROM manual_grocery WHERE id = $1', [id]);
+    res.json({ ok: true });
+  } catch (err) {
+    next(err);
+  }
 });
 
 export default router;
