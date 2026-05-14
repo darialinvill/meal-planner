@@ -104,6 +104,69 @@ function buildWeekRequest({ weekStart, recentMealNames }) {
   return `Plan the week starting Monday ${weekStart}. Generate exactly 10 lunches and 10 dinners with the ingredient-stretching plan made explicit in weekly_theme.${recents}`;
 }
 
+const RECIPE_SYSTEM_PROMPT = `You write tight, practical home recipes for a household with strict dietary requirements. Output Markdown only. No preamble, no closing remarks.
+
+Structure each recipe exactly like this:
+
+## Ingredients
+- 1 lb extra-firm tofu, pressed and cubed
+- 2 limes (zest + juice)
+- (...one per line, with quantities, grouped logically but no subheadings)
+
+## Steps
+1. First step in one sentence, imperative voice.
+2. Second step.
+3. (...numbered, 6–10 steps total, each one a complete action a tired weeknight cook can scan in 2 seconds.)
+
+## Notes
+- Optional. Only include if there's something genuinely useful: a swap that saves time, a kid-bridge hand-off point, a common pitfall.
+
+Hard rules:
+- Every ingredient and step must respect the household's dietary requirements (this household is vegan; the husband prefers gluten-free, so call out which ingredient needs to be GF when applicable — e.g. "gluten-free tamari" or "tamari (use coconut aminos for strict GF)").
+- Total active time must be realistic for the prep_minutes + cook_minutes window on the meal card. If the user's preferences cap weeknight cook time, respect it.
+- Avoid every ingredient in hard_dislikes.
+- If the meal card has a kid_bridge note, include a Notes line showing exactly where to set aside plain components for the kids.
+- Do not invent ingredients beyond what the meal card lists, unless they are pantry staples the household clearly already has (salt, pepper, neutral oil, garlic, common spices). Don't add fresh produce or proteins not already implied by the meal.`;
+
+export async function generateRecipe({ meal, preferences }) {
+  const mealCard = {
+    name: meal.name,
+    description: meal.description,
+    cuisine: meal.cuisine,
+    prep_time_minutes: meal.prep_minutes,
+    cook_time_minutes: meal.cook_minutes,
+    main_ingredients: JSON.parse(meal.main_ingredients_json || '[]'),
+    grocery_items: JSON.parse(meal.grocery_items_json || '[]'),
+    kid_bridge: meal.kid_bridge || null,
+  };
+
+  const response = await client().messages.create({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 2000,
+    system: RECIPE_SYSTEM_PROMPT,
+    messages: [
+      {
+        role: 'user',
+        content: [
+          {
+            type: 'text',
+            text: buildPreferencesText(preferences),
+            cache_control: { type: 'ephemeral', ttl: '1h' },
+          },
+          {
+            type: 'text',
+            text: `Write the full recipe for this meal:\n\n\`\`\`json\n${JSON.stringify(mealCard, null, 2)}\n\`\`\``,
+          },
+        ],
+      },
+    ],
+  });
+
+  const textBlock = response.content.find((b) => b.type === 'text');
+  if (!textBlock) throw new Error('No text block in recipe response');
+  return { markdown: textBlock.text.trim(), usage: response.usage };
+}
+
 export async function generateWeek({ preferences, weekStart, recentMealNames = [] }) {
   const stream = client().messages.stream({
     model: 'claude-opus-4-7',

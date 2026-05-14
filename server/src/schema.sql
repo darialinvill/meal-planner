@@ -83,3 +83,6 @@ CREATE TABLE IF NOT EXISTS grocery_check (
   checked SMALLINT NOT NULL DEFAULT 0,
   PRIMARY KEY (week_id, item_key)
 );
+
+ALTER TABLE weeks ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ;
+ALTER TABLE meals ADD COLUMN IF NOT EXISTS recipe_md TEXT;

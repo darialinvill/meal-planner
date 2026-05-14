@@ -1,8 +1,9 @@
 import { Router } from 'express';
 import { one, query, tx } from '../db.js';
 import { requireAuth } from '../middleware/auth.js';
-import { mondayOf } from '../lib/weeks.js';
-import { generateWeek } from '../lib/ai.js';
+import { mondayOf, formatWeekRange } from '../lib/weeks.js';
+import { generateWeek, generateRecipe } from '../lib/ai.js';
+import { sendMenuEmail } from '../lib/email.js';
 
 const router = Router();
 router.use(requireAuth);
@@ -40,6 +41,7 @@ async function loadWeekDetail(weekRow) {
     id: weekRow.id,
     week_start: weekRow.week_start,
     weekly_theme: weekRow.weekly_theme,
+    finalized_at: weekRow.finalized_at || null,
     staples_called_for: JSON.parse(weekRow.staples_json),
     meals: meals.map((m) => ({
       id: m.id,
@@ -53,6 +55,7 @@ async function loadWeekDetail(weekRow) {
       kid_bridge: m.kid_bridge,
       main_ingredients: JSON.parse(m.main_ingredients_json),
       grocery_items: JSON.parse(m.grocery_items_json),
+      recipe_md: m.recipe_md || null,
       votes: votesByMeal[m.id] || [],
     })),
   };
@@ -161,6 +164,87 @@ router.post('/generate', async (req, res, next) => {
 
     const week = await loadWeekRow(req.user.household_id, weekStart);
     res.json({ ok: true, ...(await loadWeekDetail(week)), usage: result.usage });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/finalize', async (req, res, next) => {
+  try {
+    const weekStart = req.body?.week_start || mondayOf();
+    const week = await loadWeekRow(req.user.household_id, weekStart);
+    if (!week) return res.status(404).json({ error: 'no week to finalize' });
+
+    const { n: userCount } = await one(
+      'SELECT COUNT(*)::int AS n FROM users WHERE household_id = $1',
+      [req.user.household_id],
+    );
+    if (userCount < 2) {
+      return res.status(400).json({ error: 'both household adults must sign up before finalizing' });
+    }
+
+    // Find meals where both adults voted yes.
+    const approvedMeals = await query(
+      `SELECT m.*
+         FROM meals m
+         WHERE m.week_id = $1
+           AND (SELECT COUNT(*) FROM meal_votes mv WHERE mv.meal_id = m.id AND mv.vote = 1) >= $2
+         ORDER BY m.meal_type, m.position`,
+      [week.id, userCount],
+    );
+
+    if (approvedMeals.length === 0) {
+      return res.status(400).json({
+        error: 'no meals have both yes votes yet — keep voting before finalizing',
+      });
+    }
+
+    const prefsRow = await one(
+      'SELECT data FROM preferences WHERE household_id = $1',
+      [req.user.household_id],
+    );
+    const preferences = prefsRow ? JSON.parse(prefsRow.data) : {};
+
+    // Generate (and cache) recipes for any approved meal that doesn't have one yet.
+    const generated = [];
+    for (const m of approvedMeals) {
+      if (m.recipe_md) continue;
+      try {
+        const { markdown } = await generateRecipe({ meal: m, preferences });
+        await query('UPDATE meals SET recipe_md = $1 WHERE id = $2', [markdown, m.id]);
+        m.recipe_md = markdown;
+        generated.push(m.name);
+      } catch (err) {
+        console.error('generateRecipe failed for', m.name, err);
+      }
+    }
+
+    await query('UPDATE weeks SET finalized_at = NOW() WHERE id = $1', [week.id]);
+
+    // Send the menu email to all household users.
+    const users = await query(
+      'SELECT email, display_name FROM users WHERE household_id = $1',
+      [req.user.household_id],
+    );
+    try {
+      await sendMenuEmail({
+        to: users.map((u) => u.email),
+        weekStart: week.week_start,
+        weekRange: formatWeekRange(week.week_start),
+        meals: approvedMeals,
+        appUrl: process.env.APP_URL || 'http://localhost:5173',
+      });
+    } catch (err) {
+      console.error('sendMenuEmail failed', err);
+    }
+
+    const refreshed = await loadWeekRow(req.user.household_id, weekStart);
+    res.json({
+      ok: true,
+      generated_count: generated.length,
+      approved_count: approvedMeals.length,
+      ...(await loadWeekDetail(refreshed)),
+    });
   } catch (err) {
     next(err);
   }

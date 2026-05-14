@@ -1,7 +1,10 @@
+import { useState } from 'react';
+import ReactMarkdown from 'react-markdown';
 import { useAuth } from '../auth.jsx';
 
 export default function MealCard({ meal, onVote }) {
   const { user } = useAuth();
+  const [recipeOpen, setRecipeOpen] = useState(false);
   const myVote = meal.votes.find((v) => v.user_id === user.id)?.vote;
   const total = meal.prep_minutes + meal.cook_minutes;
 
@@ -29,6 +32,21 @@ export default function MealCard({ meal, onVote }) {
         <div className="kid-bridge">
           <span className="kid-bridge-tag">Kid bridge</span>
           {meal.kid_bridge}
+        </div>
+      )}
+      {meal.recipe_md && (
+        <div style={{ marginTop: 12 }}>
+          <button
+            onClick={() => setRecipeOpen((v) => !v)}
+            style={{ background: 'none', border: '1px solid #1f6feb', color: '#1f6feb', padding: '6px 14px', borderRadius: 6, cursor: 'pointer', fontSize: 13 }}
+          >
+            {recipeOpen ? 'Hide recipe' : 'View recipe'}
+          </button>
+          {recipeOpen && (
+            <div className="recipe-md" style={{ marginTop: 10, padding: '8px 14px', background: '#fafafa', border: '1px solid #eee', borderRadius: 8, lineHeight: 1.55, fontSize: 14 }}>
+              <ReactMarkdown>{meal.recipe_md}</ReactMarkdown>
+            </div>
+          )}
         </div>
       )}
       <div className="votes">

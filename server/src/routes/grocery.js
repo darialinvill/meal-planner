@@ -14,7 +14,13 @@ function loadWeek(householdId, weekStart) {
   return one('SELECT * FROM weeks WHERE household_id = $1 AND week_start = $2', [householdId, weekStart]);
 }
 
-async function buildGroceryList(weekId) {
+async function buildGroceryList(weekId, householdId) {
+  const userCountRow = await one(
+    'SELECT COUNT(*)::int AS n FROM users WHERE household_id = $1',
+    [householdId],
+  );
+  const userCount = userCountRow?.n || 0;
+
   const meals = await query(
     `SELECT m.id, m.name, m.grocery_items_json,
             COALESCE(SUM(CASE WHEN mv.vote = 1 THEN 1 ELSE 0 END), 0) AS yes_votes
@@ -25,7 +31,10 @@ async function buildGroceryList(weekId) {
     [weekId],
   );
 
-  const approved = meals.filter((m) => Number(m.yes_votes) >= 1);
+  // Approval rule: every household adult must have voted yes.
+  const approved = userCount > 0
+    ? meals.filter((m) => Number(m.yes_votes) >= userCount)
+    : [];
 
   const aggregated = new Map();
   for (const m of approved) {
@@ -71,7 +80,7 @@ router.get('/current', async (req, res, next) => {
     const week = await loadWeek(req.user.household_id, weekStart);
     if (!week) return res.json({ exists: false, week_start: weekStart });
 
-    const fromMeals = await buildGroceryList(week.id);
+    const fromMeals = await buildGroceryList(week.id, req.user.household_id);
 
     const manual = await query(
       `SELECT mg.id, mg.name, mg.category, mg.checked, u.display_name AS added_by_name

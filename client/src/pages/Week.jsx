@@ -10,6 +10,8 @@ export default function Week() {
   const [weekStart, setWeekStart] = useState(null);
   const [loading, setLoading] = useState(true);
   const [generating, setGenerating] = useState(false);
+  const [finalizing, setFinalizing] = useState(false);
+  const [finalizeMsg, setFinalizeMsg] = useState(null);
   const [error, setError] = useState(null);
 
   const load = () => {
@@ -41,6 +43,25 @@ export default function Week() {
       setError(`Generation failed: ${e.message}${e.detail ? ` (${e.detail})` : ''}`);
     } finally {
       setGenerating(false);
+    }
+  };
+
+  const finalize = async () => {
+    setError(null);
+    setFinalizeMsg(null);
+    setFinalizing(true);
+    try {
+      const result = await api.post('/api/meals/finalize', {});
+      setFinalizeMsg(
+        `Finalized! ${result.approved_count} meal${result.approved_count === 1 ? '' : 's'} approved` +
+          (result.generated_count > 0 ? ` · ${result.generated_count} new recipe${result.generated_count === 1 ? '' : 's'} written` : '') +
+          ' · menu emailed to both of you.',
+      );
+      load();
+    } catch (e) {
+      setError(`Finalize failed: ${e.message}${e.detail ? ` (${e.detail})` : ''}`);
+    } finally {
+      setFinalizing(false);
     }
   };
 
@@ -87,10 +108,24 @@ export default function Week() {
   const lunches = week.meals.filter((m) => m.meal_type === 'lunch');
   const dinners = week.meals.filter((m) => m.meal_type === 'dinner');
 
+  const finalizedDate = week.finalized_at ? new Date(week.finalized_at) : null;
+
   return (
     <div className="container">
       <h1>Week of {week.week_start}</h1>
       {week.weekly_theme && <p className="subtitle">{week.weekly_theme}</p>}
+
+      <div style={{ background: '#f1f3f7', border: '1px solid #dde1ea', borderRadius: 10, padding: 14, margin: '12px 0 20px' }}>
+        <div style={{ fontSize: 14, color: '#444', marginBottom: 8 }}>
+          {finalizedDate
+            ? `Last finalized ${finalizedDate.toLocaleString()}. Finalizing again will generate recipes for any newly-approved meals and re-send the menu email.`
+            : 'When you and your partner have both voted yes on the meals you want, hit Finalize. We\'ll write the recipes and email both of you the menu.'}
+        </div>
+        <button className="primary" onClick={finalize} disabled={finalizing}>
+          {finalizing ? 'Writing recipes & emailing…' : finalizedDate ? 'Re-finalize this week' : 'Finalize this week'}
+        </button>
+        {finalizeMsg && <div style={{ marginTop: 10, color: '#1f6feb', fontSize: 13 }}>{finalizeMsg}</div>}
+      </div>
 
       <h2>Lunches</h2>
       {lunches.map((m) => (
