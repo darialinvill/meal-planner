@@ -208,16 +208,22 @@ async function runFinalize(householdId, week) {
   );
   const preferences = prefsRow ? JSON.parse(prefsRow.data) : {};
 
+  // Generate recipes in parallel for any approved meal without a cached one.
+  // Each call is ~10–15s; serial would be ~2 min for a typical week.
+  const toGenerate = approvedMeals.filter((m) => !m.recipe_md);
+  const results = await Promise.allSettled(
+    toGenerate.map((m) => generateRecipe({ meal: m, preferences })),
+  );
   let generated = 0;
-  for (const m of approvedMeals) {
-    if (m.recipe_md) continue;
-    try {
-      const { markdown } = await generateRecipe({ meal: m, preferences });
-      await query('UPDATE meals SET recipe_md = $1 WHERE id = $2', [markdown, m.id]);
-      m.recipe_md = markdown;
+  for (let i = 0; i < toGenerate.length; i++) {
+    const m = toGenerate[i];
+    const r = results[i];
+    if (r.status === 'fulfilled') {
+      await query('UPDATE meals SET recipe_md = $1 WHERE id = $2', [r.value.markdown, m.id]);
+      m.recipe_md = r.value.markdown;
       generated += 1;
-    } catch (err) {
-      console.error('generateRecipe failed for', m.name, err);
+    } else {
+      console.error('generateRecipe failed for', m.name, r.reason);
     }
   }
 

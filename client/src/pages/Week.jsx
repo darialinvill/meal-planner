@@ -195,7 +195,11 @@ export default function Week() {
           </button>
         ) : (
           <button className="primary" onClick={lock} disabled={locking}>
-            {locking ? 'Locking in…' : 'Lock in my picks'}
+            {locking
+              ? otherLocks.some((l) => l.locked_at)
+                ? 'Locking in… writing recipes & emailing (~20s)'
+                : 'Locking in…'
+              : 'Lock in my picks'}
           </button>
         )}
 
