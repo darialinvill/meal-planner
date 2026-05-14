@@ -15,7 +15,7 @@ async function loadWeekRow(householdId, weekStart) {
   );
 }
 
-async function loadWeekDetail(weekRow) {
+async function loadWeekDetail(weekRow, householdId) {
   if (!weekRow) return null;
   const meals = await query(
     'SELECT * FROM meals WHERE week_id = $1 ORDER BY meal_type, position',
@@ -37,11 +37,26 @@ async function loadWeekDetail(weekRow) {
     });
   }
 
+  // Roster of all household users + each one's lock state for this week.
+  const householdUsers = await query(
+    `SELECT u.id, u.display_name, wl.locked_at
+       FROM users u
+       LEFT JOIN week_locks wl ON wl.user_id = u.id AND wl.week_id = $1
+       WHERE u.household_id = $2
+       ORDER BY u.id`,
+    [weekRow.id, householdId],
+  );
+
   return {
     id: weekRow.id,
     week_start: weekRow.week_start,
     weekly_theme: weekRow.weekly_theme,
     finalized_at: weekRow.finalized_at || null,
+    locks: householdUsers.map((u) => ({
+      user_id: u.id,
+      display_name: u.display_name,
+      locked_at: u.locked_at || null,
+    })),
     staples_called_for: JSON.parse(weekRow.staples_json),
     meals: meals.map((m) => ({
       id: m.id,
@@ -66,7 +81,7 @@ router.get('/current', async (req, res, next) => {
     const weekStart = mondayOf();
     const week = await loadWeekRow(req.user.household_id, weekStart);
     if (!week) return res.json({ exists: false, week_start: weekStart });
-    res.json({ exists: true, ...(await loadWeekDetail(week)) });
+    res.json({ exists: true, ...(await loadWeekDetail(week, req.user.household_id)) });
   } catch (err) {
     next(err);
   }
@@ -76,7 +91,7 @@ router.get('/week/:weekStart', async (req, res, next) => {
   try {
     const week = await loadWeekRow(req.user.household_id, req.params.weekStart);
     if (!week) return res.status(404).json({ error: 'week not found' });
-    res.json(await loadWeekDetail(week));
+    res.json(await loadWeekDetail(week, req.user.household_id));
   } catch (err) {
     next(err);
   }
@@ -89,7 +104,7 @@ router.post('/generate', async (req, res, next) => {
 
     const existing = await loadWeekRow(req.user.household_id, weekStart);
     if (existing && !force) {
-      return res.status(409).json({ error: 'week already generated', week: await loadWeekDetail(existing) });
+      return res.status(409).json({ error: 'week already generated', week: await loadWeekDetail(existing, req.user.household_id) });
     }
 
     const prefsRow = await one(
@@ -163,69 +178,57 @@ router.post('/generate', async (req, res, next) => {
     });
 
     const week = await loadWeekRow(req.user.household_id, weekStart);
-    res.json({ ok: true, ...(await loadWeekDetail(week)), usage: result.usage });
+    res.json({ ok: true, ...(await loadWeekDetail(week, req.user.household_id)), usage: result.usage });
   } catch (err) {
     next(err);
   }
 });
 
-router.post('/finalize', async (req, res, next) => {
-  try {
-    const weekStart = req.body?.week_start || mondayOf();
-    const week = await loadWeekRow(req.user.household_id, weekStart);
-    if (!week) return res.status(404).json({ error: 'no week to finalize' });
+// Runs the finalize work for a household + week: generate recipes for any
+// not-yet-cached "both yes" meal, stamp finalized_at, and email both adults.
+// Idempotent — re-running is fine. Returns a summary the caller can echo back.
+async function runFinalize(householdId, week) {
+  const { n: userCount } = await one(
+    'SELECT COUNT(*)::int AS n FROM users WHERE household_id = $1',
+    [householdId],
+  );
 
-    const { n: userCount } = await one(
-      'SELECT COUNT(*)::int AS n FROM users WHERE household_id = $1',
-      [req.user.household_id],
-    );
-    if (userCount < 2) {
-      return res.status(400).json({ error: 'both household adults must sign up before finalizing' });
+  const approvedMeals = await query(
+    `SELECT m.*
+       FROM meals m
+       WHERE m.week_id = $1
+         AND (SELECT COUNT(*) FROM meal_votes mv WHERE mv.meal_id = m.id AND mv.vote = 1) >= $2
+       ORDER BY m.meal_type, m.position`,
+    [week.id, userCount],
+  );
+
+  const prefsRow = await one(
+    'SELECT data FROM preferences WHERE household_id = $1',
+    [householdId],
+  );
+  const preferences = prefsRow ? JSON.parse(prefsRow.data) : {};
+
+  let generated = 0;
+  for (const m of approvedMeals) {
+    if (m.recipe_md) continue;
+    try {
+      const { markdown } = await generateRecipe({ meal: m, preferences });
+      await query('UPDATE meals SET recipe_md = $1 WHERE id = $2', [markdown, m.id]);
+      m.recipe_md = markdown;
+      generated += 1;
+    } catch (err) {
+      console.error('generateRecipe failed for', m.name, err);
     }
+  }
 
-    // Find meals where both adults voted yes.
-    const approvedMeals = await query(
-      `SELECT m.*
-         FROM meals m
-         WHERE m.week_id = $1
-           AND (SELECT COUNT(*) FROM meal_votes mv WHERE mv.meal_id = m.id AND mv.vote = 1) >= $2
-         ORDER BY m.meal_type, m.position`,
-      [week.id, userCount],
-    );
+  await query('UPDATE weeks SET finalized_at = NOW() WHERE id = $1', [week.id]);
 
-    if (approvedMeals.length === 0) {
-      return res.status(400).json({
-        error: 'no meals have both yes votes yet — keep voting before finalizing',
-      });
-    }
-
-    const prefsRow = await one(
-      'SELECT data FROM preferences WHERE household_id = $1',
-      [req.user.household_id],
-    );
-    const preferences = prefsRow ? JSON.parse(prefsRow.data) : {};
-
-    // Generate (and cache) recipes for any approved meal that doesn't have one yet.
-    const generated = [];
-    for (const m of approvedMeals) {
-      if (m.recipe_md) continue;
-      try {
-        const { markdown } = await generateRecipe({ meal: m, preferences });
-        await query('UPDATE meals SET recipe_md = $1 WHERE id = $2', [markdown, m.id]);
-        m.recipe_md = markdown;
-        generated.push(m.name);
-      } catch (err) {
-        console.error('generateRecipe failed for', m.name, err);
-      }
-    }
-
-    await query('UPDATE weeks SET finalized_at = NOW() WHERE id = $1', [week.id]);
-
-    // Send the menu email to all household users.
-    const users = await query(
-      'SELECT email, display_name FROM users WHERE household_id = $1',
-      [req.user.household_id],
-    );
+  const users = await query(
+    'SELECT email FROM users WHERE household_id = $1',
+    [householdId],
+  );
+  let emailed = false;
+  if (approvedMeals.length > 0 && users.length > 0) {
     try {
       await sendMenuEmail({
         to: users.map((u) => u.email),
@@ -234,17 +237,64 @@ router.post('/finalize', async (req, res, next) => {
         meals: approvedMeals,
         appUrl: process.env.APP_URL || 'http://localhost:5173',
       });
+      emailed = true;
     } catch (err) {
       console.error('sendMenuEmail failed', err);
+    }
+  }
+
+  return { approved_count: approvedMeals.length, generated_count: generated, emailed };
+}
+
+router.post('/lock', async (req, res, next) => {
+  try {
+    const weekStart = req.body?.week_start || mondayOf();
+    const week = await loadWeekRow(req.user.household_id, weekStart);
+    if (!week) return res.status(404).json({ error: 'no week to lock' });
+
+    await query(
+      `INSERT INTO week_locks (week_id, user_id) VALUES ($1, $2)
+       ON CONFLICT (week_id, user_id) DO UPDATE SET locked_at = NOW()`,
+      [week.id, req.user.id],
+    );
+
+    // If every household user is now locked, run the finalize work.
+    const { ready } = await one(
+      `SELECT (
+         SELECT COUNT(*) FROM week_locks WHERE week_id = $1
+       ) = (
+         SELECT COUNT(*) FROM users WHERE household_id = $2
+       ) AS ready`,
+      [week.id, req.user.household_id],
+    );
+
+    let summary = null;
+    if (ready) {
+      summary = await runFinalize(req.user.household_id, week);
     }
 
     const refreshed = await loadWeekRow(req.user.household_id, weekStart);
     res.json({
       ok: true,
-      generated_count: generated.length,
-      approved_count: approvedMeals.length,
-      ...(await loadWeekDetail(refreshed)),
+      ready_to_finalize: !!ready,
+      ...(summary || {}),
+      ...(await loadWeekDetail(refreshed, req.user.household_id)),
     });
+  } catch (err) {
+    next(err);
+  }
+});
+
+router.post('/unlock', async (req, res, next) => {
+  try {
+    const weekStart = req.body?.week_start || mondayOf();
+    const week = await loadWeekRow(req.user.household_id, weekStart);
+    if (!week) return res.status(404).json({ error: 'no week to unlock' });
+
+    await query('DELETE FROM week_locks WHERE week_id = $1 AND user_id = $2', [week.id, req.user.id]);
+
+    const refreshed = await loadWeekRow(req.user.household_id, weekStart);
+    res.json({ ok: true, ...(await loadWeekDetail(refreshed, req.user.household_id)) });
   } catch (err) {
     next(err);
   }
@@ -274,6 +324,13 @@ router.post('/:mealId/vote', async (req, res, next) => {
         [mealId, req.user.id, vote],
       );
     }
+    // Voting after locking clears your lock — "I'm done" is invalidated by a vote change.
+    await query(
+      `DELETE FROM week_locks
+         WHERE user_id = $1
+           AND week_id = (SELECT week_id FROM meals WHERE id = $2)`,
+      [req.user.id, mealId],
+    );
     res.json({ ok: true });
   } catch (err) {
     next(err);

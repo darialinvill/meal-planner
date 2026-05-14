@@ -86,3 +86,12 @@ CREATE TABLE IF NOT EXISTS grocery_check (
 
 ALTER TABLE weeks ADD COLUMN IF NOT EXISTS finalized_at TIMESTAMPTZ;
 ALTER TABLE meals ADD COLUMN IF NOT EXISTS recipe_md TEXT;
+
+-- Per-user "I'm done voting" state. Once every household user has a row
+-- for the week, the server auto-runs the finalize flow (recipes + email).
+CREATE TABLE IF NOT EXISTS week_locks (
+  week_id INTEGER NOT NULL REFERENCES weeks(id) ON DELETE CASCADE,
+  user_id INTEGER NOT NULL REFERENCES users(id),
+  locked_at TIMESTAMPTZ NOT NULL DEFAULT NOW(),
+  PRIMARY KEY (week_id, user_id)
+);
