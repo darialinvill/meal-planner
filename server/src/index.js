@@ -71,8 +71,8 @@ async function main() {
     console.error('[db] schema init failed', err);
     process.exit(1);
   }
-  app.listen(port, () => {
-    console.log(`Nourish server listening on http://localhost:${port}`);
+  app.listen(port, '0.0.0.0', () => {
+    console.log(`Nourish server listening on http://0.0.0.0:${port}`);
     startCron();
   });
 }
