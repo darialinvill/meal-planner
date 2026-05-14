@@ -1,8 +1,10 @@
 import { useEffect, useState } from 'react';
 import { api } from '../api.js';
+import { useAuth } from '../auth.jsx';
 import MealCard from '../components/MealCard.jsx';
 
 export default function Week() {
+  const { user } = useAuth();
   const [week, setWeek] = useState(null);
   const [exists, setExists] = useState(true);
   const [weekStart, setWeekStart] = useState(null);
@@ -43,8 +45,25 @@ export default function Week() {
   };
 
   const vote = async (mealId, value) => {
-    await api.post(`/api/meals/${mealId}/vote`, { vote: value });
-    load();
+    const prevWeek = week;
+    setWeek((prev) => ({
+      ...prev,
+      meals: prev.meals.map((m) => {
+        if (m.id !== mealId) return m;
+        const others = m.votes.filter((v) => v.user_id !== user.id);
+        if (value === null) return { ...m, votes: others };
+        return {
+          ...m,
+          votes: [...others, { user_id: user.id, vote: value, display_name: user.display_name }],
+        };
+      }),
+    }));
+    try {
+      await api.post(`/api/meals/${mealId}/vote`, { vote: value });
+    } catch (e) {
+      setWeek(prevWeek);
+      setError(`Vote failed: ${e.message}`);
+    }
   };
 
   if (loading) return <div className="container">Loading…</div>;
